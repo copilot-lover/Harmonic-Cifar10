@@ -32,7 +32,6 @@ hyp = {
         'momentum': 0.85,
         'weight_decay': 0.012,   # weight decay per 1024 examples (decoupled from learning rate)
         'bias_scaler': 64.0,     # scales up learning rate (but not weight decay) for BatchNorm biases
-        'label_smoothing': 0.2,
         'whiten_bias_epochs': 3, # how many epochs to train the whitening layer bias before freezing
     },
     'aug': {
@@ -299,6 +298,34 @@ class Mul(nn.Module):
     def forward(self, x):
         return x * self.scale
 
+
+
+class DistLayer(nn.Linear):
+    def __init__(self, in_features, out_features, n=None, eps=1e-4, bias=False):
+        super().__init__(in_features, out_features, bias=bias)
+        self.n = float(in_features if n is None else n)
+        self.eps = eps
+
+    def forward(self, x):
+        # x: (B, N), w: (V, N), returns unnormalized HarMax scores
+        w = self.weight
+        wx = torch.einsum('bn,vn->bv', x, w)
+        ww = torch.norm(w, dim=-1).square()
+        xx = torch.norm(x, dim=-1).square()
+        dist_sq = ww[None, :] + xx[:, None] - 2 * wx + self.eps
+        dist_sq = dist_sq / dist_sq.amin(dim=-1, keepdim=True)
+        return dist_sq.pow(-self.n)
+
+
+class HarMax(nn.Module):
+    def forward(self, harmonic_scores):
+        probs = harmonic_scores / harmonic_scores.sum(dim=1, keepdim=True)
+        return probs.log()
+
+
+def harmonic_loss(log_probs, labels):
+    return -log_probs[torch.arange(log_probs.size(0), device=labels.device), labels]
+
 class BatchNorm(nn.BatchNorm2d):
     def __init__(self, num_features, eps=1e-12,
                  weight=False, bias=True):
@@ -356,7 +383,6 @@ class ConvGroup(nn.Module):
 
 def make_net(hyp):
     widths = hyp['widths']
-    scaling_factor = hyp['scaling_factor']
     depth = hyp['depth']
     whiten_kernel_size = 2
     whiten_width = 2 * 3 * whiten_kernel_size**2
@@ -368,8 +394,8 @@ def make_net(hyp):
         ConvGroup(widths['block2'], widths['block3'], depth),
         nn.MaxPool2d(3),
         Flatten(),
-        nn.Linear(widths['block3'], 10, bias=False),
-        Mul(scaling_factor),
+        DistLayer(widths['block3'], 10, n=widths['block3'], bias=False),
+        HarMax(),
     )
     net[0].weight.requires_grad = False
     net = net.half().cuda()
@@ -381,7 +407,7 @@ def make_net(hyp):
 
 def reinit_net(model):
     for m in model.modules():
-        if type(m) in (Conv, BatchNorm, nn.Linear):
+        if type(m) in (Conv, BatchNorm, nn.Linear, DistLayer):
             m.reset_parameters()
 
 #############################################
@@ -463,7 +489,7 @@ def train_proxy(hyp, model, data_seed):
     wd = hyp['opt']['weight_decay'] * batch_size / kilostep_scale
     lr_biases = lr * hyp['opt']['bias_scaler']
 
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
+    loss_fn = harmonic_loss
     train_loader = InfiniteCifarLoader('cifar10', train=True, batch_size=batch_size, aug=hyp['aug'],
                                        aug_seed=data_seed, order_seed=data_seed)
     steps_per_epoch = len(train_loader.images) // batch_size
@@ -548,7 +574,7 @@ def main(run, hyp, model_proxy, model_trainbias, model_freezebias):
     import random
     data_seed = random.randint(0, 2**50)
 
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
+    loss_fn = harmonic_loss
     test_loader = InfiniteCifarLoader('cifar10', train=False, batch_size=2000)
     train_loader = InfiniteCifarLoader('cifar10', train=True, batch_size=batch_size, aug=hyp['aug'],
                                        aug_seed=data_seed, order_seed=data_seed)
@@ -708,4 +734,3 @@ if __name__ == "__main__":
     log_path = os.path.join(log_dir, 'log.pt')
     print(os.path.abspath(log_path))
     torch.save(log, os.path.join(log_dir, 'log.pt'))
-
