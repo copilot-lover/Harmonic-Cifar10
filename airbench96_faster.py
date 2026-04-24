@@ -307,20 +307,21 @@ class DistLayer(nn.Linear):
         self.eps = eps
 
     def forward(self, x):
-        # x: (B, N), w: (V, N), returns unnormalized HarMax scores
+        # x: (B, N), w: (V, N), returns log unnormalized HarMax scores
         w = self.weight
         wx = torch.einsum('bn,vn->bv', x, w)
         ww = torch.norm(w, dim=-1).square()
         xx = torch.norm(x, dim=-1).square()
         dist_sq = ww[None, :] + xx[:, None] - 2 * wx + self.eps
         dist_sq = dist_sq / dist_sq.amin(dim=-1, keepdim=True)
-        return dist_sq.pow(-self.n)
+        # Compute in fp32 log-space to avoid fp16 underflow from dist_sq.pow(-n).
+        dist_sq = dist_sq.float().clamp_min(self.eps)
+        return -self.n * dist_sq.log()
 
 
 class HarMax(nn.Module):
-    def forward(self, harmonic_scores):
-        probs = harmonic_scores / harmonic_scores.sum(dim=1, keepdim=True)
-        return probs.log()
+    def forward(self, log_harmonic_scores):
+        return F.log_softmax(log_harmonic_scores, dim=1)
 
 
 def harmonic_loss(log_probs, labels):
